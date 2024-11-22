@@ -3,6 +3,8 @@ import pandas as pd
 from typing import List
 from abc import ABC, abstractmethod
 
+ME_INDEX = 0
+
 
 class GDPlayer:
     def __init__(self):
@@ -14,15 +16,16 @@ class GDPlayer:
         stepsize = 1/(1+self.iteration_count)
         dual_budg, dual_roi = self.dual_vars[-1]
         
-        dual_budg_new = np.maximum(0, dual_roi - stepsize * grad_budg)
-        dual_roi_new = np.maximum(0,dual_budg - stepsize * grad_roi)
+        dual_budg_new = np.maximum(0, dual_budg - stepsize * grad_budg)
+        dual_roi_new = np.maximum(0, dual_roi - stepsize * grad_roi)
         self.dual_vars.append([dual_budg_new,dual_roi_new])
         self.iteration_count +=1
 
 
 class Autobidder(GDPlayer):
-    def __init__(self, rho: float, gamma:float, total_budg: float=None, stop_when_no_budg:bool=False):
+    def __init__(self, id: int, rho: float, gamma:float, total_budg: float=None, stop_when_no_budg:bool=False):
         super().__init__()
+        self.id = id
         self.rho = rho
         self.gamma = gamma
         self.payments = []
@@ -46,7 +49,7 @@ class Autobidder(GDPlayer):
         is_winner = cost > 0
         g1 = (val - self.gamma * cost) * is_winner
         g2 = self.rho - cost 
-        self.update_grad(grad_budg=g1,grad_roi=g2)
+        self.update_grad(grad_budg=g2,grad_roi=g1)
         
     def get_total_val(self):
         return np.sum(self.obtained_values)
@@ -78,29 +81,35 @@ class Channel:
         self.players_over_phases = []
         self.phase_lens = []
         self.historical_payments = []
+        self.historical_cost = []
      
     def init_new_phase(self,list_players: List[GDPlayer]):
         self.players_over_phases.append(list_players)
         
     def run_phase(self, values:np.ndarray, auction: Auction, phase_n_players: int =-1):
-        phase_bids = []
         num_rounds, num_players = values.shape
         self.phase_lens.append(num_rounds)
         playerlist = self.players_over_phases[phase_n_players]
         assert num_players == len(playerlist), "input values per round must match with number of players"
         phase_payment_hist = []
+        phase_cost_hist = []
         for _round in range(num_rounds):
             player_values = values[_round]
             bids = []
+            cost = 0
             for ind,player in enumerate(playerlist):
                 bids.append(player.submit_bid(player_values[ind]))
+                if player.id != ME_INDEX and player.submit_bid(player_values[ind]) > cost:
+                    cost = player.submit_bid(player_values[ind])
             allocation, payment = auction.allocate(bids)
             phase_payment_hist.append(np.sum(payment))
+            phase_cost_hist.append(cost)
             for ind,player in enumerate(playerlist):
                 realized_val = player_values[ind] * allocation[ind]
                 realized_cost = payment[ind]
                 player.update(realized_val,realized_cost)
         self.historical_payments.append(phase_payment_hist)
+        self.historical_cost.append(phase_cost_hist)
         
     def get_phase_total_vals(self, phase_n_players: int =-1):
         playerlist = self.players_over_phases[phase_n_players]
@@ -115,15 +124,14 @@ class AlgoRunner(GDPlayer):
     def __init__(
         self, 
         gamma: float,
-        total_budg: float, 
+        budg_per_phase: float, 
         arm_set: np.array, 
         init_budg_alloc: List[float],
         num_channels: int
     ):
         super().__init__()
         self.gamma = gamma
-        self.total_budg = total_budg
-        self.remaining_budg = total_budg
+        self.budg_per_phase = budg_per_phase
         self.arm_set = arm_set
         self.budg_alloc = [init_budg_alloc]
         self.num_channels = num_channels
@@ -132,22 +140,22 @@ class AlgoRunner(GDPlayer):
         self.per_channel_budgets = []
         self.chosen_arms=[]
         self.obtained_values = []
-    def update(self, val:List[float]):
+    def update(self, val:List[float], cost: List[float]):
         self.obtained_values.append(val)
         total_spend = 0
         _per_channel_budg = self.per_channel_budgets[-1]
         _chosen_arms = self.chosen_arms[-1]
         for ind in range(self.num_channels):
             chosen_arm_id =  int(_chosen_arms[ind])
-            total_spend += self.arm_set[chosen_arm_id]
+            total_spend += cost[ind]
         
             self.V_bar[ind][chosen_arm_id] = self.V_bar[ind][chosen_arm_id] * self.pull_nums[ind][chosen_arm_id] + val[ind]
             self.pull_nums[ind][chosen_arm_id] += 1
             self.V_bar[ind][chosen_arm_id] /= self.pull_nums[ind][chosen_arm_id]
             
         g1 = np.sum(val) - self.gamma * total_spend
-        g2 = self.remaining_budg - total_spend
-        self.update_grad(grad_budg=g1, grad_roi=g2)
+        g2 = self.budg_per_phase - total_spend
+        self.update_grad(grad_budg=g2, grad_roi=g1)
         self.remaining_budg = g2
             
     def get_phase_budg_alloc(self, scaler_const: float):
@@ -220,8 +228,6 @@ if __name__ == "__main__":
         TOTAL_ROUNDS = NUM_PHASE * ROUNDS_PER_PHASE
         COMPETITOR_RHO = 0.1
         COMPETITOR_GAMMA = 0.1
-        # COMPETITOR_NUM = 2
-        ME_INDEX = 0
         STOP_NO_BUDG = False
 
         ME_ROI = 0.1
@@ -231,7 +237,7 @@ if __name__ == "__main__":
 
         ME = AlgoRunner(
             gamma = ME_ROI, 
-            total_budg = ME_TOTAL_BUDG,
+            budg_per_phase = ME_RHO,
             arm_set=ME_ARMSET, 
             init_budg_alloc=[min(ME_ARMSET) for channel in CHANNELS],
             num_channels= len(CHANNELS),
@@ -247,9 +253,9 @@ if __name__ == "__main__":
 
             for ind,channel in enumerate(CHANNELS):
                 num_competitors = (ind + 1) * COMPETITOR_NUM
-                playerlist = [Autobidder(rho=ME_budg_allocation[ind], gamma= 0, stop_when_no_budg=STOP_NO_BUDG)]\
+                playerlist = [Autobidder(id=ME_INDEX, rho=ME_budg_allocation[ind], gamma= 0, stop_when_no_budg=STOP_NO_BUDG)]\
                 + [
-                    Autobidder(rho=COMPETITOR_RHO, gamma= COMPETITOR_GAMMA,stop_when_no_budg=STOP_NO_BUDG)
+                    Autobidder(id=ME_INDEX + i, rho=COMPETITOR_RHO, gamma= COMPETITOR_GAMMA,stop_when_no_budg=STOP_NO_BUDG)
                     for i in range(num_competitors)
                 ]
                 channel.init_new_phase(playerlist)
@@ -259,7 +265,7 @@ if __name__ == "__main__":
 
             ME_phase_val = [channel.get_phase_total_vals()[ME_INDEX] for channel in CHANNELS]
             ME_phase_cost = [channel.get_phase_total_pyament()[ME_INDEX] for channel in CHANNELS]
-            ME.update(val=ME_phase_val)
+            ME.update(val=ME_phase_val, cost=ME_phase_cost)
 
         """Organize Results"""
         flattened_historical_costs = []
@@ -267,8 +273,8 @@ if __name__ == "__main__":
         avg_channel_cost = []
         avg_ME_channel_values = []
         for ind,channel in enumerate(CHANNELS):
-            flattened_historical_costs += list(np.hstack(channel.historical_payments))
-            avg_channel_cost.append(np.mean(np.hstack(channel.historical_payments)))
+            flattened_historical_costs += list(np.hstack(channel.historical_cost))
+            avg_channel_cost.append(np.mean(np.hstack(channel.historical_cost)))
             flattened_ME_historical_values += list(np.hstack(ME_historical_values[ind]))
             avg_ME_channel_values.append(np.mean(np.hstack(ME_historical_values[ind])))
         optimal_hindsight_allocation = AlgoRunner.deterministic_best_alloc(
